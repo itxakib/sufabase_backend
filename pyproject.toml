@@ -1,0 +1,21 @@
+[project]
+name = "sufabase"
+version = "0.1.0"
+description = "backend django"
+authors = [
+    {name = "123344556677",email = "hananabdul659@gmail.com"}
+]
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "django (>=6.1.1,<7.0.0)",
+    "djangorestframework (>=3.18.1,<4.0.0)",
+    "psycopg[binary] (>=3.3.5,<4.0.0)",
+    "djangorestframework-simplejwt (>=5.5.1,<6.0.0)",
+    "python-decouple (>=3.8,<4.0)",
+    "django-environ (>=0.14.0,<0.15.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
