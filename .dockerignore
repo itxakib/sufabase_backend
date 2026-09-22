@@ -1,0 +1,37 @@
+# Everything here is excluded from the image build context — the image gets the
+# code, not the developer's machine.
+#
+# The two that matter most:
+#   .env    local secrets, which must reach the container as runtime env instead
+#   media/  user uploads (avatars, CNIC copies, documents) — private, and large;
+#           they belong on a mounted volume, not inside an image layer.
+
+# Version control
+.git
+.gitignore
+
+# Local virtualenv and interpreter artefacts. Poetry installs fresh inside the
+# image, and host bytecode is platform-specific.
+.venv
+__pycache__/
+*.py[cod]
+
+# Environment: passed with --env-file / compose `environment:` at run time.
+.env
+.env.*
+
+# Runtime data and generated output, not source
+media/
+staticfiles/
+*.log
+
+# Reference material and one-off import scripts — not needed to serve requests
+docs/
+*.pdf
+*.xls
+_examine_lcci*.py
+
+# Editor / tooling noise
+.vscode
+.freebuff
+cursorrules*

@@ -29,6 +29,28 @@ DEBUG = config('DEBUG', default=True, cast=bool)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=list)
 
 
+# CORS — allow the frontend dev server and any configured origins.
+# In production this should be locked to the actual deployed domain.
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS',
+    default='http://localhost:5173,http://127.0.0.1:5173',
+    cast=lambda v: [s.strip() for s in v.split(',')],
+)
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-company-id',
+]
+
+
 # Application definition
 
 INSTALLED_APPS = [
@@ -39,17 +61,41 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'django_filters',
+    'corsheaders',
+    'drf_spectacular',
+    'rest_framework_simplejwt.token_blacklist',
+    # Local apps
+    'common',
+    'tenant',
+    'users',
+    'customers',
+    'catalog',
+    'bookings',
+    'consultancy',
+    'dashboard',
+    # B2B lead directory (Chamber-of-Commerce style bulk imports). Deliberately
+    # separate from `customers`: a directory row is an unvetted lead, and only
+    # becomes a Customer when staff explicitly convert it.
+    'directory',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'common.middleware.CompanyContextMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Custom staff user model.
+# MUST be set before the first migration: the users app starts with no migrations,
+# so this is the last moment it can change without dropping the auth tables.
+AUTH_USER_MODEL = 'users.User'
 
 ROOT_URLCONF = 'config.urls'
 
@@ -123,6 +169,20 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 
+# Media files (user uploads)
+# https://docs.djangoproject.com/en/6.1/topics/file-uploads/
+#
+# Required by common.Attachment.file, and by every future document upload in the
+# modules (CNIC copies, vouchers, scanned passports). Absolute rather than
+# relative like STATIC_URL above, because FileField.url joins this against the
+# current page URL - a relative MEDIA_URL yields broken links inside the admin.
+# Django only serves this in development (DEBUG); production points a web server
+# or object storage at it. The directory is git-ignored.
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
+
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
@@ -140,11 +200,59 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_FILTER_BACKENDS': (
+        'django_filters.rest_framework.DjangoFilterBackend',
+        'rest_framework.filters.SearchFilter',
+        'rest_framework.filters.OrderingFilter',
+    ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,
+    'DEFAULT_SCHEMA_CLASS': 'common.schema.AppTaggedSchema',
+    'DEFAULT_RENDERER_CLASSES': ['common.renderers.APIResponseRenderer'],
+    'EXCEPTION_HANDLER': 'common.exception_handler.custom_exception_handler',
+}
+
+# drf-spectacular — OpenAPI 3.0 schema generation
+# https://drf-spectacular.readthedocs.io/en/latest/settings.html
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'SUFABASE API',
+    'DESCRIPTION': 'Multi-module SaaS platform for SUFA International — travel, tourism, and visa services.',
+    'VERSION': '0.1.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    # Tags group endpoints by app in the Swagger UI.
+    # Prevent drf-spectacular from merging different status enums into one.
+    'ENUM_NAME_OVERRIDES': {
+        'HajjBookingStatusEnum': 'bookings.choices.BookingStageChoices',
+        'VisaCaseStatusEnum': 'consultancy.choices.VisaCaseStatusChoices',
+        'StudyVisaStatusEnum': 'consultancy.choices.StudyVisaApplicationStatusChoices',
+        'TicketStatusEnum': 'bookings.choices.TicketStatusChoices',
+        'HotelStatusEnum': 'bookings.choices.HotelStatusChoices',
+        'TransportStatusEnum': 'bookings.choices.TransportStatusChoices',
+        'CustomerStageEnum': 'customers.choices.StageChoices',
+        'CustomerRecordStatusEnum': 'customers.choices.RecordStatusChoices',
+        'VisaDecisionEnum': 'consultancy.choices.VisaDecisionChoices',
+    },
+    'TAGS': [
+        {'name': 'Auth', 'description': 'Staff login, token refresh, and logout.'},
+        {'name': 'Users', 'description': 'Staff user management.'},
+        {'name': 'Tenants', 'description': 'Company (tenant) management.'},
+        {'name': 'Customers', 'description': 'Customer CRM records.'},
+        {'name': 'Catalog', 'description': 'Sellable package specs — room, cabin, and vehicle. No guest or ticket data.'},
+        {'name': 'Bookings', 'description': 'Hajj, Umrah, Tour, Ticketing, Hotel, Transport service records and trip bundles.'},
+        {'name': 'Consultancy', 'description': 'Visa consultancy and study visa case workflows.'},
+        {'name': 'Dashboard', 'description': 'Dashboard summary and analytics.'},
+        {'name': 'Settings', 'description': 'Company settings panel.'},
+        {'name': 'Attachments', 'description': 'Generic document uploads — list, download links, relabel, delete.'},
+        {'name': 'Directory', 'description': 'B2B company/lead directory — bulk import, search, and conversion to customers.'},
+    ],
 }
 
 SIMPLE_JWT = {
+    # Rotation + blacklist is what makes /api/v1/token/logout/ actually invalidate
+    # a session instead of just forgetting the token client-side.
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=config('JWT_TOKEN_EXPIRATION', default=7, cast=int)),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=config('JWT_REFRESH_TOKEN_EXPIRATION', default=1, cast=int)),
 }

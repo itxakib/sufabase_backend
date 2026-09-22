@@ -1,0 +1,158 @@
+# SUFABASE Backend — Cursor Rules
+
+You are working on the backend for **SUFABASE**, a multi-module CRM for SUFA International
+(Hajj, Umrah, hotel, tour, and ticketing business). Stack: **Django + Django REST Framework**,
+serving a React/Vite frontend. This is a multi-tenant system (multiple companies use the
+same platform) — tenant scoping is a GLOBAL concern from day one, not deferred to Module 07.
+
+---
+
+## 1. Tech Stack
+- Django + Django REST Framework (DRF) for all APIs.
+- PostgreSQL, shared schema with a `company_id` (tenant) column on every tenant-owned model.
+- Celery for anything async/long-running: WhatsApp/email sends, AI generation, campaigns.
+- Secrets via `.env` / `django-environ` — never hardcoded.
+
+---
+
+## 2. Project Structure — module apps + a shared `common/` app
+```
+sufabase/
+  config/                 # settings, urls, wsgi/asgi
+  common/                 # SHARED — everything reusable lives here, nowhere else
+    models.py              # BaseModel, TenantScopedModel (abstract base w/ company FK, timestamps)
+    managers.py             # TenantManager — auto-filters querysets by company
+    middleware.py             # CompanyContextMiddleware — reads company from request
+    permissions.py             # base DRF permission classes (IsSameCompany, etc.)
+    services/                    # BaseService pattern shared across modules
+    serializers.py                 # shared base serializers
+    exceptions.py                    # custom exception classes, shared error handling
+    utils.py
+  apps/
+    core/                  # Module 01 — users, company/tenant model itself
+    rbac/                   # Module 02 — roles, permissions, security hardening
+    pipeline/                 # Module 03 — leads, intake, sales→ops→finance, quote engine
+    crm/                        # Module 04 — reporting, segmentation, priority clients
+    outreach/                     # Module 05 — WhatsApp & email
+    ai_marketing/                    # Module 06 — ad copy, image gen, campaigns, approval loop
+    saas_admin/                        # Module 07 — cross-company admin, billing, plan limits
+```
+Rule of thumb: if a piece of logic/model/utility is or could be used by more than one module app, it belongs in `common/`, not duplicated per app. Never copy-paste a base model or permission class between apps — import from `common`.
+
+---
+
+## 3. Tenant Scoping — GLOBAL, enforced everywhere, no exceptions
+This is the single most important rule in this codebase.
+
+- **Every tenant-owned model** inherits from `common.models.TenantScopedModel`, which has a
+  `company = ForeignKey(Company, ...)` field plus created/updated timestamps. No model that
+  belongs to a company gets created without this base class.
+- **Company context comes from a request header**: `X-Company-ID`. A `CompanyContextMiddleware`
+  in `common/middleware.py` reads this header on every request, validates the requesting user
+  actually belongs to that company, and attaches `request.company` for the rest of the request
+  lifecycle. Views/services never trust a `company_id` passed in the request body for scoping —
+  only `request.company` from the validated header.
+- **All querysets are tenant-scoped by default** via a custom manager (`TenantManager` in
+  `common/managers.py`) that filters on `request.company` automatically. Raw `Model.objects.all()`
+  calls that skip tenant filtering are treated as a bug — if you ever see `.objects.all()` on a
+  tenant-scoped model without an explicit, justified reason (e.g. a superadmin cross-tenant report
+  in `saas_admin`), flag it.
+- **DRF viewsets**: use a shared `TenantScopedViewSetMixin` (in `common/`) that automatically
+  filters `get_queryset()` by `request.company` and auto-injects `company` on create — don't
+  hand-roll `perform_create` per viewset.
+- **Serializers** never accept `company` as a writable field from the client — it's always set
+  server-side from `request.company`, never trusted from payload.
+- Cross-tenant data leakage is treated as a security bug, not a bug — any change touching models,
+  querysets, or serializers must be checked against "could this leak another company's data?"
+  before being considered done.
+- `saas_admin` (Module 07) is the ONLY app allowed to intentionally query across tenants
+  (platform-level reporting/billing) — and it must do so explicitly and visibly (e.g. a clearly
+  named `AdminCrossTenantService`), never silently.
+
+---
+
+## 4. Service Layer Pattern — staticmethods, not instance state
+- Business logic does NOT live in views or serializers. It lives in a `services.py` (or
+  `services/` package for larger apps) per module app, as classes composed of **`@staticmethod`**
+  methods — no instance state, no `self`, no service objects being instantiated and passed around.
+
+```python
+# apps/pipeline/services.py
+class QuoteService:
+    @staticmethod
+    def calculate_quote(lead, rule_set=None):
+        rule_set = rule_set or QuoteService.get_active_rule_set(lead.company)
+        # deterministic pricing logic here
+        return quote
+
+    @staticmethod
+    def get_active_rule_set(company):
+        ...
+```
+
+- Views/viewsets call `SomeService.some_method(...)` directly — they stay thin: parse request →
+  call service staticmethod → serialize response. No business logic inline in `views.py`.
+- Shared cross-module service utilities (e.g. a generic "notify user" or "log audit event")
+  go in `common/services/` as a `BaseService`-style staticmethod class, not duplicated per app.
+- Because these are staticmethods, tenant scoping is NOT implicit via `self` — every service
+  method that touches tenant data must take `company` (or a model instance that carries
+  `company`) explicitly as a parameter. Never rely on a global/thread-local for company context
+  inside a service method — pass it in explicitly so the method stays testable and unambiguous.
+
+---
+
+## 5. RBAC & Security (Module 02)
+- All permission logic lives in `apps/rbac/`, built on top of `common/permissions.py` base
+  classes — never inline `if request.user.role == 'admin'` checks in views.
+- Permission classes must check BOTH role/permission AND tenant match (`IsSameCompany` +
+  role-based class combined) — a correct role check that ignores tenant is still a security bug.
+- Field-level permission filtering was descoped per client decision — don't build it unless
+  explicitly asked again.
+- Django admin never exposed without hardened auth outside local dev.
+
+---
+
+## 6. Quote Engine (Module 03) — deterministic, not AI, tenant-aware
+- Deterministic, rules-based calculator (plain Python) — not an LLM call.
+- Pricing rule sets are tenant-scoped (`company` FK) so each SUFA-type client on the platform
+  can eventually have its own rules — pass `company` explicitly into every service call per
+  Rule 4 above.
+- Version rule changes; old quotes stay reproducible against the rules that generated them.
+
+---
+
+## 7. Outreach (Module 05) & AI Marketing (Module 06)
+- WhatsApp/BSP calls and AI-generation calls go through dedicated service classes
+  (staticmethods, per Rule 4) — never called directly from views or Celery tasks inline.
+- All Meta/WhatsApp and AI-generation costs are pass-through costs to the client — track cost
+  per message/generation, scoped by `company`, so it can be billed back to the right tenant.
+- AI-generated content requires explicit human approval (status: draft → pending_approval →
+  approved → published) before publishing — no auto-publish.
+- Meta webhook for messaging lives in `outreach`; Meta webhook for lead capture lives in
+  `pipeline` — don't duplicate handling between the two (this overlap was already found and
+  resolved once).
+
+---
+
+## 8. Multi-tenancy / Platform Admin (Module 07)
+- The tenant model itself (`Company`) and enforcement machinery (middleware, managers, mixins)
+  live in `common/`/`core` from day one (see Rule 3) — Module 07 is about **platform-level
+  admin on top of that**: billing, plan limits, cross-tenant reporting, company onboarding —
+  not about retrofitting tenant scoping, since that's already baked in everywhere.
+
+---
+
+## 9. Testing & Migrations
+- Every new model/endpoint needs at least: a tenant-isolation test (company A can't see company
+  B's data) + a happy-path API test. Tenant-isolation tests are not optional.
+- Never hand-edit migration files — generate via `makemigrations`, review before committing.
+
+---
+
+## 10. General Guardrails for AI-Generated Code in This Repo
+- Never write a queryset, serializer, or view that skips tenant scoping "just for now."
+- Never put business logic in `views.py` — it belongs in a service staticmethod.
+- Never duplicate a base model, permission class, manager, or utility that already exists in
+  `common/` — import it.
+- Don't invent new frontend contract fields without flagging (`# TODO: confirm with frontend`).
+- Secrets always via environment variables — never in code or comments.
