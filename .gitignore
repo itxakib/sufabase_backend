@@ -26,3 +26,10 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated OpenAPI schema snapshots (regenerate: python manage.py spectacular)
+docs/openapi-schema.json
+docs/openapi-schema.yml
+
+# One-off data-examination scripts
+_examine*.py
